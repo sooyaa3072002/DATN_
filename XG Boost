@@ -1,0 +1,263 @@
+https://colab.research.google.com/drive/1uuCIqGlBQaljnK7wGX1ZQV0KAD7t2ler?usp=sharing
+
+#CODE
+# === CÀI ĐẶT THƯ VIỆN (nếu chưa có thì bật lệnh này) ===
+# !pip install pandas numpy scikit-learn matplotlib xgboost seaborn
+
+# === KHAI BÁO THƯ VIỆN ===
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, mean_squared_error, classification_report, confusion_matrix, mean_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier, XGBRegressor
+from google.colab import files
+
+# === HÀM GIÁ MUA ĐIỆN ===
+def get_price(h):
+    if 22 <= h or h < 4:
+        return 1830
+    elif (9.5 <= h < 11.5) or (17 <= h < 20):
+        return 5174
+    else:
+        return 3007
+
+# === TẢI DỮ LIỆU ===
+print("\U0001F4C2 Vui lòng tải lên tệp CSV dữ liệu huấn luyện...")
+uploaded = files.upload()
+file_name = list(uploaded.keys())[0]
+df = pd.read_csv(f"/content/{file_name}")
+
+# === THÊM CỘT GIÁ MUA/BÁN ĐIỆN ===
+df['Gia_mua_dien_moi'] = df['Hour'].apply(get_price)
+df['Gia_ban_dien_moi'] = 671
+
+# === LỌC DỮ LIỆU VỚI GIỚI HẠN SOC ===
+SOC_FULL = 19.2  # SOC pin full 19.2 kWh
+SOC_min = 0.2 * SOC_FULL
+SOC_max = 0.8 * SOC_FULL
+df = df[(df['SOC_kWh'] >= SOC_min) & (df['SOC_kWh'] <= SOC_max)]
+
+# === CHỌN ĐẦU VÀO VÀ ĐẦU RA ===
+features = ['Hour', 'PV_Power_kW', 'Load_Power_kW', 'SOC_kWh', 'Gia_mua_dien_moi', 'Gia_ban_dien_moi']
+X = df[features]
+y_action = df['action']
+y_p_charge = df['P_charge_kW']
+y_p_discharge = df['P_discharge_kW']
+
+# === CHIA TRAIN/TEST ===
+X_train, X_test, y_action_train, y_action_test, y_p_charge_train, y_p_charge_test, y_p_discharge_train, y_p_discharge_test = train_test_split(
+    X, y_action, y_p_charge, y_p_discharge, test_size=0.2, random_state=42
+)
+
+# === CHUẨN HÓA ===
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# === HUẤN LUYỆN MODEL HÀNH ĐỘNG ===
+model_action = XGBClassifier(use_label_encoder=False, eval_metric='mlogloss')
+model_action.fit(X_train_scaled, y_action_train)
+
+# === HUẤN LUYỆN MODEL P_charge ===
+mask_charge = y_action_train.reset_index(drop=True) == 1
+X_train_df = pd.DataFrame(X_train_scaled)
+model_p_charge = XGBRegressor()
+model_p_charge.fit(X_train_df[mask_charge], y_p_charge_train.reset_index(drop=True)[mask_charge])
+
+# === HUẤN LUYỆN MODEL P_discharge ===
+mask_discharge = y_action_train.reset_index(drop=True) == 2
+model_p_discharge = XGBRegressor()
+model_p_discharge.fit(X_train_df[mask_discharge], y_p_discharge_train.reset_index(drop=True)[mask_discharge])
+
+# === ĐÁNH GIÁ MÔ HÌNH ===
+# Dự đoán hành động
+y_pred_action = model_action.predict(X_test_scaled)
+
+# Đánh giá phân loại hành động
+print("\n--- Phân loại hành động ---")
+acc = accuracy_score(y_action_test, y_pred_action)
+print(f"Độ chính xác phân loại hành động: {acc:.3f}")
+print("Báo cáo phân loại:\n", classification_report(y_action_test, y_pred_action))
+
+cm = confusion_matrix(y_action_test, y_pred_action)
+plt.figure(figsize=(6,4))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+plt.title("Confusion Matrix - Action")
+plt.xlabel("Dự đoán")
+plt.ylabel("Thực tế")
+plt.show()
+
+# Dự báo công suất sạc/xả
+mask_charge_test = y_action_test.reset_index(drop=True) == 1
+mask_discharge_test = y_action_test.reset_index(drop=True) == 2
+X_test_df = pd.DataFrame(X_test_scaled)
+
+pch_true = y_p_charge_test.reset_index(drop=True)[mask_charge_test]
+pch_pred = model_p_charge.predict(X_test_df[mask_charge_test])
+
+pdis_true = y_p_discharge_test.reset_index(drop=True)[mask_discharge_test]
+pdis_pred = model_p_discharge.predict(X_test_df[mask_discharge_test])
+
+# Đánh giá hồi quy P_charge
+print("\n--- Hồi quy P_charge ---")
+rmse_charge = np.sqrt(mean_squared_error(pch_true, pch_pred))
+mae_charge = mean_absolute_error(pch_true, pch_pred)
+r2_charge = r2_score(pch_true, pch_pred)
+print(f"RMSE: {rmse_charge:.3f} kW")
+print(f"MAE: {mae_charge:.3f} kW")
+print(f"R^2: {r2_charge:.3f}")
+
+plt.figure(figsize=(6,4))
+plt.scatter(pch_true, pch_pred, alpha=0.5)
+plt.plot([min(pch_true), max(pch_true)], [min(pch_true), max(pch_true)], 'r--')
+plt.title("P_charge: Thực tế vs Dự đoán")
+plt.xlabel("Thực tế (kW)")
+plt.ylabel("Dự đoán (kW)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Đánh giá hồi quy P_discharge
+print("\n--- Hồi quy P_discharge ---")
+rmse_discharge = np.sqrt(mean_squared_error(pdis_true, pdis_pred))
+mae_discharge = mean_absolute_error(pdis_true, pdis_pred)
+r2_discharge = r2_score(pdis_true, pdis_pred)
+print(f"RMSE: {rmse_discharge:.3f} kW")
+print(f"MAE: {mae_discharge:.3f} kW")
+print(f"R^2: {r2_discharge:.3f}")
+
+plt.figure(figsize=(6,4))
+plt.scatter(pdis_true, pdis_pred, alpha=0.5)
+plt.plot([min(pdis_true), max(pdis_true)], [min(pdis_true), max(pdis_true)], 'r--')
+plt.title("P_discharge: Thực tế vs Dự đoán")
+plt.xlabel("Thực tế (kW)")
+plt.ylabel("Dự đoán (kW)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === MÔ PHỎNG ĐIỀU KHIỂN TRONG 1 NGÀY ===
+pv_new = ([0, 0, 0, 0, 0, 0, 0.66, 1.32, 2.42, 7.30, 3.96, 4.40, 4.62, 4.40, 3.96, 3.08, 1.98, 0.88, 0, 0, 0, 0, 0, 0])
+load_new = ([0.61, 0.61, 0.61, 0.61, 0.61, 0.61, 1.90, 2.15, 0.30, 0.30, 0.28, 3.13, 0.685, 0.68, 0.38, 0.38, 0.38, 1.52, 3.92, 3.92, 2.02, 2.02, 0.82, 0.67])
+soc = 0.5 * SOC_FULL  # Bắt đầu SOC ở 50%
+soc_list = []
+actions = []
+charges = []
+discharges = []
+P_charge_max = 9.6
+P_discharge_max = 19.2
+
+# Thêm danh sách lưu P bán, P mua, tiền bán, tiền mua, lợi nhuận
+P_ban = []
+P_mua = []
+Tien_ban = []
+Tien_mua = []
+Loi_nhuan = []
+
+for t in range(24):
+    row = pd.DataFrame([{
+        'Hour': t,
+        'PV_Power_kW': pv_new[t],
+        'Load_Power_kW': load_new[t],
+        'SOC_kWh': soc,
+        'Gia_mua_dien_moi': get_price(t),
+        'Gia_ban_dien_moi': 671
+    }])
+
+    row_scaled = scaler.transform(row)
+    action = model_action.predict(row_scaled)[0]
+
+    # Giới hạn SOC
+    if (soc >= SOC_max and action == 1) or (soc <= SOC_min and action == 2):
+        action = 0
+
+    p_chg = p_dis = 0
+    if action == 1:
+        p_chg = model_p_charge.predict(row_scaled)[0]
+        p_chg = min(p_chg*0.9, P_charge_max, SOC_max - soc)
+        soc += p_chg
+        soc = min(soc, SOC_max)
+    elif action == 2:
+        p_dis = model_p_discharge.predict(row_scaled)[0]
+        p_dis = min(p_dis/0.85, P_discharge_max, soc - SOC_min)
+        soc -= p_dis
+        soc = max(soc, SOC_min)
+
+    # Tính P bán (điện dư bán ra)
+    p_ban = max(0, pv_new[t] - load_new[t] - p_chg)
+
+    # Tính P mua (điện thiếu phải mua)
+    p_mua = max(0, load_new[t] - (pv_new[t] + p_dis))
+
+    # Tính tiền bán và tiền mua
+    tien_ban = p_ban * 671
+    tien_mua = p_mua * get_price(t)
+
+    # Lợi nhuận
+    loi_nhuan = tien_ban - tien_mua
+
+    # Lưu biến
+    actions.append(action)
+    charges.append(p_chg)
+    discharges.append(p_dis)
+    soc_list.append(soc)
+
+    P_ban.append(p_ban)
+    P_mua.append(p_mua)
+    Tien_ban.append(tien_ban)
+    Tien_mua.append(tien_mua)
+    Loi_nhuan.append(loi_nhuan)
+
+# === In kết quả tổng ===
+print(f"Tổng tiền bán: {sum(Tien_ban):,.0f} VNĐ")
+print(f"Tổng tiền mua: {sum(Tien_mua):,.0f} VNĐ")
+print(f"Lợi nhuận tổng: {sum(Loi_nhuan):,.0f} VNĐ")
+
+plt.figure(figsize=(12, 10))
+
+# Biểu đồ hành động
+plt.subplot(4, 1, 1)
+plt.plot(range(24), actions, 'ro-', label="Hành động")
+plt.xticks(range(24))
+plt.ylabel("Action")
+plt.legend()
+plt.grid(True)
+
+# Biểu đồ công suất sạc/xả và SOC
+plt.subplot(4, 1, 2)
+plt.plot(range(24), charges, 'g--o', label="P_charge")
+plt.plot(range(24), discharges, 'b--o', label="P_discharge")
+plt.plot(range(24), soc_list, 'm-o', label="SOC (kWh)")
+plt.xticks(range(24))
+plt.ylabel("Công suất / SOC")
+plt.legend()
+plt.grid(True)
+
+# Biểu đồ P mua và P bán
+plt.subplot(4, 1, 3)
+plt.plot(range(24), P_ban, 'green', label='P bán (kW)')
+plt.plot(range(24), P_mua, 'red', label='P mua (kW)')
+plt.xticks(range(24))
+plt.ylabel("Công suất (kW)")
+plt.title("Công suất mua/bán theo giờ")
+plt.legend()
+plt.grid(True)
+
+# Biểu đồ tiền và lợi nhuận
+plt.subplot(4, 1, 4)
+plt.plot(range(24), Tien_ban, 'green', label='Tiền bán (VNĐ)')
+plt.plot(range(24), Tien_mua, 'red', label='Tiền mua (VNĐ)')
+plt.plot(range(24), Loi_nhuan, 'blue', label='Lợi nhuận (VNĐ)')
+plt.xticks(range(24))
+plt.xlabel("Giờ")
+plt.ylabel("VNĐ")
+plt.title("Tiền mua, bán và lợi nhuận theo giờ")
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
